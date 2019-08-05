@@ -1,0 +1,191 @@
+#!/bin/bash
+set -e
+shopt -s extglob
+
+STORE_DIR=${STORE_DIR:-"$HOME/.private/stores"}
+MOUNT_DIR=${MOUNT_DIR:-"$HOME/.private/mnt"}
+
+init_common_vars() {
+    STORE_FILE="$STORE_DIR/$STORE_NAME"
+    STORE_DEV="/dev/mapper/$STORE_NAME"
+    STORE_MOUNT="$MOUNT_DIR/$STORE_NAME"
+}
+
+exit_with_usage() {
+    cat >&2 <<EOF
+Usage: $0 <command> <options ...>
+
+Commands:
+    n, new, create: Create new private store
+    o, open: Open existing private store
+    c, close: Close private store
+    l, ls, list: List private stores
+    r, rm: Remove a private store
+EOF
+exit $1
+}
+
+if [ -z "$1" ]; then
+    exit_with_usage 1
+fi
+
+COMMAND="$1"
+shift
+
+priv_do_open() {
+    if [ ! -d "$STORE_MOUNT" ]; then
+        mkdir -v -p "$STORE_MOUNT"
+    fi
+    echo "Mounting at '$STORE_MOUNT'..."
+    sudo mount "$STORE_DEV" "$STORE_MOUNT"
+}
+
+priv_create() {
+    if [ "$#" -ne 2 ]; then
+        cat >&2 <<EOF
+Usage: $0 (n|new|create) <name> <size>
+
+    name: The name for the private store
+    size: The size of the store, in gigabytes
+EOF
+        exit 2
+    fi
+
+    STORE_NAME="$1"
+    STORE_SIZE="$(($2 * 1024))"
+    init_common_vars
+
+    if [ -f "$STORE_FILE" ]; then
+        echo "Error: A store by that name already exists. Did you mean 'open' instead of '$COMMAND'?" >&2
+        exit 3
+    fi
+
+    if [ ! -d "$STORE_DIR" ]; then
+        mkdir -v -p "$STORE_DIR"
+    fi
+
+    echo "Creating new private store '$STORE_NAME' of $STORE_SIZE MB..."
+    read -p "Passprase: " -s PASSPHRASE
+    echo
+    echo "Allocating space..."
+    dd if=/dev/zero of="$STORE_FILE" bs=1M count=$STORE_SIZE
+    echo "Formatting as LUKS device..."
+    echo "$PASSPHRASE" | sudo /sbin/cryptsetup -q luksFormat -d - "$STORE_FILE"
+    echo "Opening the LUKS device..."
+    echo "$PASSPHRASE" | sudo /sbin/cryptsetup open "$STORE_FILE" -d - "$STORE_NAME"
+    echo "Formatting encrypted device with ext4 file system..."
+    sudo mkfs.ext4 "$STORE_DEV"
+    priv_do_open
+    sudo chown "$USER:$GROUP" "$STORE_MOUNT"
+    echo "All done."
+}
+
+priv_open() {
+    if [ "$#" -ne 1 ]; then
+        cat >&2 <<EOF
+Usage: $0 (o|open) <name>
+
+    name: The name for the private store to open
+EOF
+        exit 2
+    fi
+    STORE_NAME="$1"
+    init_common_vars
+
+    if [ ! -f "$STORE_FILE" ]; then
+        echo "Error: No store by that name exists (at $STORE_FILE)" >&2
+        exit 3
+    fi
+
+    if mount | grep "$STORE_DEV" >/dev/null; then
+        echo "Error: This store is already open." >&2
+        exit 3 
+    fi
+
+    read -p "Passprase: " -s PASSPHRASE
+    echo
+    echo "Opening LUKS device..."
+    echo "$PASSPHRASE" | sudo /sbin/cryptsetup open "$STORE_FILE" -d - "$STORE_NAME"
+    priv_do_open
+}
+
+priv_close() {
+    if [ "$#" -ne 1 ]; then
+        cat >&2 <<EOF
+Usage: $0 (c|close) <name>
+
+    name: The name for the private store to close
+EOF
+        exit 2
+    fi
+    STORE_NAME="$1"
+    init_common_vars
+
+    if [ ! -f "$STORE_FILE" ]; then
+        echo "Error: No store by that name exists (at $STORE_FILE)" >&2
+        exit 3
+    fi
+
+    if ! mount | grep "$STORE_DEV" >/dev/null; then
+        echo "Error: This store is not currently open." >&2
+        exit 3 
+    fi
+
+    echo "Unmounting '$STORE_MOUNT'..."
+    sudo umount "$STORE_MOUNT"
+    echo "Closing LUKS device..."
+    sudo /sbin/cryptsetup close "$STORE_NAME"
+}
+
+priv_list() {
+    ls -l "$STORE_DIR"
+}
+
+priv_rm() {
+    if [ "$#" -ne 1 ]; then
+        cat >&2 <<EOF
+Usage: $0 (r|rm) <name>
+
+    name: The name for the private store to remove
+EOF
+    fi
+    STORE_NAME="$1"
+    init_common_vars
+    
+    if [ ! -f "$STORE_FILE" ]; then
+        echo "Error: No store by that name exists (at $STORE_FILE)" >&2
+        exit 3
+    fi
+
+    if mount | grep "$STORE_DEV" >/dev/null; then
+        echo "Error: This store is currently open." >&2
+        exit 3 
+    fi
+
+    rm -v "$STORE_FILE"
+
+    if [ -d "$STORE_MOUNT" ]; then
+        rmdir -v "$STORE_MOUNT"
+    fi
+}
+
+case "$COMMAND" in
+    n?(ew)|create ) 
+        priv_create "$@"
+        ;;
+    o?(pen) )
+        priv_open "$@"
+        ;;
+    c?(lose) )
+        priv_close "$@"
+        ;;
+    l?(ist)|ls )
+        priv_list "$@"
+        ;;
+    r?(m) )
+        priv_rm "$@"
+        ;;
+    *)
+        exit_with_usage 2
+        ;;
+esac
